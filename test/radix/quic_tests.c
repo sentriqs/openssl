@@ -2953,10 +2953,11 @@ static int inject_new_conn_id_plain(RADIX_FAULT *fault, QUIC_PKT_HDR *hdr,
 {
     int ok = 0;
     WPACKET wpkt;
-    unsigned char frame_buf[64];
-    size_t i, written;
+    unsigned char frame_buf[1000];
+    size_t i, written, j;
     uint64_t seq_no = 0, retire_prior_to = 0;
     QUIC_CONN_ID new_cid = { 0 };
+    unsigned int repeat = 1;
 
     if (hdr->type != QUIC_PKT_TYPE_1RTT)
         return 1;
@@ -3000,29 +3001,37 @@ static int inject_new_conn_id_plain(RADIX_FAULT *fault, QUIC_PKT_HDR *hdr,
         seq_no = 20;
         retire_prior_to = 5;
         break;
+    case 7:
+        ossl_quic_channel_get_diag_local_cid(fault->ch, &new_cid);
+        seq_no = 2;
+        retire_prior_to = 1;
+        repeat = 20;
+        break;
     }
 
     if (!TEST_true(WPACKET_init_static_len(&wpkt, frame_buf,
             sizeof(frame_buf), 0)))
         return 0;
 
-    if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, OSSL_QUIC_FRAME_TYPE_NEW_CONN_ID))
-        || !TEST_true(WPACKET_quic_write_vlint(&wpkt, seq_no)) /* seq no */
-        || !TEST_true(WPACKET_quic_write_vlint(&wpkt, retire_prior_to)) /* retire prior to */
-        || !TEST_true(WPACKET_put_bytes_u8(&wpkt, new_cid.id_len))) /* len */
-        goto err;
-
-    for (i = 0; i < new_cid.id_len && i < OSSL_NELEM(new_cid.id); ++i)
-        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, new_cid.id[i])))
+    for (j = 0; j < repeat; j++) {
+        if (!TEST_true(WPACKET_quic_write_vlint(&wpkt, OSSL_QUIC_FRAME_TYPE_NEW_CONN_ID))
+            || !TEST_true(WPACKET_quic_write_vlint(&wpkt, seq_no)) /* seq no */
+            || !TEST_true(WPACKET_quic_write_vlint(&wpkt, retire_prior_to)) /* retire prior to */
+            || !TEST_true(WPACKET_put_bytes_u8(&wpkt, new_cid.id_len))) /* len */
             goto err;
 
-    for (; i < new_cid.id_len; ++i)
-        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, 0x55)))
-            goto err;
+        for (i = 0; i < new_cid.id_len && i < OSSL_NELEM(new_cid.id); ++i)
+            if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, new_cid.id[i])))
+                goto err;
 
-    for (i = 0; i < QUIC_STATELESS_RESET_TOKEN_LEN; ++i)
-        if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, 0x42)))
-            goto err;
+        for (; i < new_cid.id_len; ++i)
+            if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, 0x55)))
+                goto err;
+
+        for (i = 0; i < QUIC_STATELESS_RESET_TOKEN_LEN; ++i)
+            if (!TEST_true(WPACKET_put_bytes_u8(&wpkt, 0x42)))
+                goto err;
+    }
 
     if (!TEST_true(WPACKET_get_total_written(&wpkt, &written))
         || !radix_fault_prepend_frame(fault, frame_buf, written))
@@ -3678,8 +3687,144 @@ DEF_SCRIPT(script_74, "place holder for multistrem script_74")
 {
 }
 
-DEF_SCRIPT(script_75, "place holder for multistrem script_75")
+/*
+ * No channel exists yet for an unaccepted connection, so the usual
+ * RADIX_FAULT channel mutator can't intercept this datagram; filter the
+ * listener's wbio directly instead.
+ */
+#define BIO_TYPE_SCRIPT_75_FILTER (0x80 | BIO_TYPE_FILTER)
+static BIO_METHOD *script_75_filter_meth;
+static uint32_t script_75_word0;
+static const QUIC_CONN_ID *init_dcid;
+
+DEF_FUNC(get_init_dcid)
 {
+    int ok = 0;
+    SSL *client;
+    QUIC_CHANNEL *ch;
+
+    REQUIRE_SSL(client);
+    ch = ossl_quic_conn_get_channel(client);
+    if (!TEST_ptr(ch))
+        goto err;
+
+    init_dcid = ossl_quic_channel_get_init_dcid(ch);
+    if (!TEST_ptr(init_dcid))
+        goto err;
+
+    ok = 1;
+err:
+    return ok;
+}
+
+static int script_75_sendmmsg(BIO *b, BIO_MSG *msg, size_t stride,
+    size_t num_msg, uint64_t flags, size_t *msgs_processed)
+{
+    BIO *next = BIO_next(b);
+    QUIC_PKT_HDR hdr;
+    WPACKET wpkt;
+    size_t written;
+
+    if (next == NULL)
+        return 0;
+
+    if (script_75_word0 != 0 && num_msg > 0) {
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.type = QUIC_PKT_TYPE_VERSION_NEG;
+        hdr.version = 0;
+        hdr.fixed = 1;
+        hdr.dst_conn_id.id_len = 0;
+        hdr.src_conn_id.id_len = init_dcid->id_len;
+        memcpy(hdr.src_conn_id.id, init_dcid->id, init_dcid->id_len);
+
+        if (!TEST_true(WPACKET_init_static_len(&wpkt, msg[0].data,
+                msg[0].data_len, 0)))
+            return 0;
+
+        if (!TEST_true(ossl_quic_wire_encode_pkt_hdr(&wpkt, 0, &hdr, NULL))
+            || !TEST_true(WPACKET_put_bytes_u32(&wpkt,
+                script_75_word0 == 1 ? QUIC_VERSION_1 : 0x5432abcd))
+            || !TEST_true(WPACKET_get_total_written(&wpkt, &written))) {
+            WPACKET_cleanup(&wpkt);
+            return 0;
+        }
+        WPACKET_finish(&wpkt);
+
+        msg[0].data_len = written;
+        script_75_word0 = 0;
+    }
+
+    return BIO_sendmmsg(next, msg, stride, num_msg, flags, msgs_processed);
+}
+
+static long script_75_ctrl(BIO *b, int cmd, long larg, void *parg)
+{
+    BIO *next = BIO_next(b);
+
+    if (next == NULL)
+        return -1;
+
+    return BIO_ctrl(next, cmd, larg, parg);
+}
+
+DEF_FUNC(script_75_arm_version_neg)
+{
+    int ok = 0;
+    SSL *listener;
+    BIO *filter, *real_wbio;
+
+    REQUIRE_SSL(listener);
+
+    script_75_word0 = 2; /* unknown version */
+
+    if (script_75_filter_meth == NULL) {
+        if (!TEST_ptr(script_75_filter_meth = BIO_meth_new(
+                          BIO_TYPE_SCRIPT_75_FILTER, "Version Negotiation Filter")))
+            goto err;
+        if (!TEST_true(BIO_meth_set_sendmmsg(script_75_filter_meth,
+                script_75_sendmmsg))
+            || !TEST_true(BIO_meth_set_ctrl(script_75_filter_meth,
+                script_75_ctrl)))
+            goto err;
+    }
+
+    if (!TEST_ptr(real_wbio = SSL_get_wbio(listener)))
+        goto err;
+    if (!TEST_true(BIO_up_ref(real_wbio)))
+        goto err;
+
+    if (!TEST_ptr(filter = BIO_new(script_75_filter_meth))) {
+        BIO_free(real_wbio);
+        goto err;
+    }
+
+    if (!TEST_ptr(BIO_push(filter, real_wbio))) {
+        BIO_free(real_wbio);
+        BIO_free(filter);
+        goto err;
+    }
+
+    SSL_set0_wbio(listener, filter);
+
+    ok = 1;
+err:
+    return ok;
+}
+
+DEF_SCRIPT(script_75, "Version negotiation: Unknown version causes connection abort")
+{
+    OP_NEW_SSL_L_LISTEN(L);
+
+    OP_SELECT_SSL(0, L);
+    OP_FUNC(script_75_arm_version_neg);
+
+    OP_NEW_SSL_C(C);
+    OP_SELECT_SSL(0, C);
+    OP_FUNC(get_init_dcid);
+    OP_SET_PEER_ADDR_FROM(C, L);
+    OP_CONNECT_WAIT_OR_FAIL(C);
+
+    OP_EXPECT_CONN_CLOSE_INFO(C, OSSL_QUIC_ERR_CONNECTION_REFUSED, 0, 0);
 }
 
 DEF_SCRIPT(script_76, "place holder for multistrem script_76")
@@ -3878,6 +4023,90 @@ DEF_SCRIPT(new_connid, "verify remote peer does not send excessive amount of NEW
     OP_EXPECT_CONN_CLOSE_INFO(C, OSSL_QUIC_ERR_CONNECTION_ID_LIMIT_ERROR, 0, 0);
 }
 
+DEF_FUNC(check_new_conn_id_count)
+{
+    int ok = 0;
+    SSL *ssl;
+    QUIC_CHANNEL *ch;
+    uint64_t on_new_conn_id_recv;
+
+    REQUIRE_SSL(ssl);
+    ch = ossl_quic_conn_get_channel(ssl);
+    if (!TEST_ptr(ch))
+        goto err;
+
+    on_new_conn_id_recv = ossl_quic_channel_get_on_new_conn_id_handled(ch);
+
+    if (on_new_conn_id_recv == 0)
+        F_SPIN_AGAIN();
+
+    /*
+     * although test sends 20 NEW_CONNECTION_ID frames, only one should
+     * be handled, because 19 frames just retransmissions.
+     */
+    if (!TEST_uint64_t_eq(on_new_conn_id_recv, 1))
+        goto err;
+
+    ok = 1;
+err:
+    return ok;
+}
+
+DEF_SCRIPT(new_connid_retrans, "verify remote peer ignores retransmitted NEW_CONNID frames")
+{
+    OP_SIMPLE_PAIR_CONN();
+    OP_WRITE_B(C, "apple");
+    OP_ACCEPT_CONN_WAIT(L, S, 0);
+    OP_SET_INCOMING_STREAM_POLICY(C, SSL_INCOMING_STREAM_POLICY_ACCEPT, 42 /* error code */);
+    OP_SET_INCOMING_STREAM_POLICY(S, SSL_INCOMING_STREAM_POLICY_ACCEPT, 42 /* error code */);
+    OP_READ_EXPECT_B(S, "apple");
+
+    OP_SET_INJECT_PLAIN(S, inject_new_conn_id_plain);
+    OP_SET_INJECT_WORD(1, 7);
+
+    OP_WRITE_B(S, "orange");
+    OP_READ_EXPECT_B(C, "orange");
+
+    OP_SELECT_SSL(0, C);
+    OP_FUNC(check_new_conn_id_count);
+
+    OP_WRITE_B(S, "banana");
+}
+
+DEF_FUNC(corrupt_dcid)
+{
+    static QUIC_CONN_ID corrupt_dcid;
+
+    memcpy(&corrupt_dcid, init_dcid, sizeof(QUIC_CONN_ID));
+    corrupt_dcid.id[0] = corrupt_dcid.id[0] ^ 0x55;
+    init_dcid = &corrupt_dcid;
+
+    return 1;
+}
+
+DEF_SCRIPT(ver_neg_check_dcid, "version negotiation must come with matching dcid")
+{
+    OP_NEW_SSL_L_LISTEN(L);
+
+    OP_SELECT_SSL(0, L);
+    OP_FUNC(script_75_arm_version_neg);
+
+    OP_NEW_SSL_C(C);
+    OP_SELECT_SSL(0, C);
+    OP_FUNC(get_init_dcid);
+    OP_FUNC(corrupt_dcid);
+    OP_SET_PEER_ADDR_FROM(C, L);
+    OP_CONNECT_WAIT(C);
+    OP_SET_DEFAULT_STREAM_MODE(C, SSL_DEFAULT_STREAM_MODE_NONE);
+
+    OP_ACCEPT_CONN_WAIT_ND(L, S, 0);
+
+    OP_NEW_STREAM(C, Ca, 0);
+    OP_WRITE(Ca, "apple", 5);
+    OP_ACCEPT_STREAM_WAIT(S, Sa, 0);
+    OP_READ_EXPECT(Sa, "apple", 5);
+}
+
 /*
  * List of Test Scripts
  * ============================================================================
@@ -3999,4 +4228,6 @@ static SCRIPT_INFO *const scripts[] = {
     USE(script_105),
     USE(script_106),
     USE(new_connid),
+    USE(new_connid_retrans),
+    USE(ver_neg_check_dcid),
 };

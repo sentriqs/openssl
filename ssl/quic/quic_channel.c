@@ -2496,6 +2496,9 @@ static void ch_rx_handle_packet(QUIC_CHANNEL *ch, int channel_only)
         if (ch->qrx_pkt->hdr->version != 0)
             return;
 
+        if (!ossl_quic_conn_id_eq(&ch->qrx_pkt->hdr->src_conn_id, &ch->init_dcid))
+            return;
+
         /*
          * RFC 9000 s. 6.2: If a client receives a version negotiation
          * packet, we need to do the following:
@@ -3464,6 +3467,13 @@ void ossl_quic_channel_on_new_conn_id(QUIC_CHANNEL *ch,
         return;
     }
 
+    /*
+     * do nothing if dealing with older NEW_CONN_ID frame or retransmission.
+     */
+    if (new_remote_seq_num == ch->cur_remote_seq_num)
+        return;
+    ch->on_new_conn_id_handled++;
+
     if (new_remote_seq_num > ch->cur_remote_seq_num) {
         /* Add new stateless reset token */
         if (!ossl_quic_srtm_add(ch->srtm, ch, new_remote_seq_num,
@@ -4416,4 +4426,14 @@ uint64_t ossl_quic_channel_get_path_challenge_count(const QUIC_CHANNEL *ch)
 uint64_t ossl_quic_channel_get_path_response_count(const QUIC_CHANNEL *ch)
 {
     return ch->path_response_tx;
+}
+
+uint64_t ossl_quic_channel_get_on_new_conn_id_handled(const QUIC_CHANNEL *ch)
+{
+    return ch->on_new_conn_id_handled;
+}
+
+const QUIC_CONN_ID *ossl_quic_channel_get_init_dcid(const QUIC_CHANNEL *ch)
+{
+    return &ch->init_dcid;
 }
